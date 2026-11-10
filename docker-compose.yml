@@ -1,0 +1,70 @@
+# Local pilot topology. NOT RUN on the authoring machine (no Docker) - written, reviewed, unbuilt.
+#
+#   docker compose up -d api                      # seeds synthetic data on first start, serves the ticket API
+#   docker compose run --rm agent                 # triage every new ticket -> pending proposals only
+#   docker compose run --rm agent ask "How long do pending proposals stay valid?"
+#   docker compose run --rm approver proposals list
+#   docker compose run --rm approver approve <proposal_id> --actor maya.lindqvist
+#
+# Trust boundary: only `api` and `approver` receive OPS_AGENT_WRITE_TOKEN. The `agent` container (which
+# starts the MCP server as a stdio child process) never has it, so even a fully hijacked model cannot write.
+
+x-image: &image
+  build: .
+  image: northwind/ops-agent:local
+
+volumes:
+  data: {}
+
+services:
+  seed:   # one-shot; idempotent so a restart never wipes proposals or the audit log
+    <<: *image
+    entrypoint: ["sh", "-c"]
+    command: ["test -f /data/tickets.db && echo 'data present, not reseeding' || ops-agent seed --seed 42"]
+    healthcheck: {disable: true}
+    volumes: ["data:/data"]
+    restart: "no"
+
+  api:
+    <<: *image
+    command: ["serve-api", "--host", "0.0.0.0", "--port", "8765"]
+    depends_on:
+      seed: {condition: service_completed_successfully}
+    environment:
+      OPS_AGENT_WRITE_TOKEN: ${OPS_AGENT_WRITE_TOKEN:?set OPS_AGENT_WRITE_TOKEN in .env (see docs/04-runbook.md)}
+    volumes: ["data:/data"]
+    ports: ["127.0.0.1:8765:8765"]
+    restart: unless-stopped
+
+  agent:
+    <<: *image
+    profiles: ["tools"]
+    entrypoint: ["ops-agent"]
+    command: ["triage", "--all-open"]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck: {disable: true}
+    environment:
+      OPS_AGENT_API_URL: http://api:8765
+      OPS_AGENT_PROVIDER: ${OPS_AGENT_PROVIDER:-offline}
+      OPS_AGENT_MODEL: ${OPS_AGENT_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPS_AGENT_PRICE_INPUT_PER_MTOK: ${OPS_AGENT_PRICE_INPUT_PER_MTOK:-0}
+      OPS_AGENT_PRICE_OUTPUT_PER_MTOK: ${OPS_AGENT_PRICE_OUTPUT_PER_MTOK:-0}
+      # deliberately NO OPS_AGENT_WRITE_TOKEN here
+    volumes: ["data:/data"]   # docs (read), control.db (proposals), traces (JSONL)
+
+  approver:
+    <<: *image
+    profiles: ["tools"]
+    entrypoint: ["ops-agent"]
+    command: ["proposals", "list"]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck: {disable: true}
+    environment:
+      OPS_AGENT_API_URL: http://api:8765
+      OPS_AGENT_WRITE_TOKEN: ${OPS_AGENT_WRITE_TOKEN:?set OPS_AGENT_WRITE_TOKEN}
+    volumes: ["data:/data"]

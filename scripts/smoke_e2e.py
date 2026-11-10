@@ -37,6 +37,19 @@ def main() -> int:
             print("API did not start", file=sys.stderr)
             return 1
         pid = asyncio.run(_agent_side(env))
+        # The triage agent as a CLI: it spawns the MCP server as a stdio child and only creates proposals.
+        t_before = httpx.get(f"{URL}/tickets/NW-1052").json()
+        tri = subprocess.run(
+            [sys.executable, "-m", "ops_agent.cli", "triage", "NW-1052"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("triage (stdio):", tri.stdout.strip().splitlines()[0])
+        t_after = httpx.get(f"{URL}/tickets/NW-1052").json()
+        agent_ok = "(pending)" in tri.stdout and t_after["version"] == t_before["version"]
+        print("agent wrote nothing directly:", agent_ok)
         before = httpx.get(f"{URL}/tickets/NW-1051").json()
         out = subprocess.run(
             [sys.executable, "-m", "ops_agent.cli", "approve", pid, "--actor", "maya.lindqvist"],
@@ -66,7 +79,8 @@ def main() -> int:
             text=True,
         )
         print(audit.stdout.strip())
-        ok = after["priority"] == "P1" and after["version"] == before["version"] + 1 and audit.returncode == 0
+        applied = after["priority"] == "P1" and after["version"] == before["version"] + 1
+        ok = agent_ok and applied and audit.returncode == 0
         print("SMOKE OK" if ok else "SMOKE FAILED")
         return 0 if ok else 1
     finally:

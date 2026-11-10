@@ -3,7 +3,7 @@ PY      ?= .venv/bin/python
 DATA    ?= data
 export OPS_AGENT_DATA_DIR := $(abspath $(DATA))
 
-.PHONY: setup seed api mcp test lint typecheck check smoke clean
+.PHONY: setup seed api mcp test lint typecheck check eval smoke clean
 
 setup:            ## create .venv and install the package with dev tools
 	@command -v uv >/dev/null && uv venv -q -p 3.11 .venv && uv pip install -q --python .venv -e ".[dev]" \
@@ -28,6 +28,9 @@ typecheck:
 	$(PY) -m mypy
 
 check: lint typecheck test
+
+eval:             ## offline evaluation: agent vs baseline vs red team; writes the report; fails below thresholds
+	$(PY) -m ops_agent.cli eval --report docs/06-evaluation-report.md --json evals/results/offline-latest.json --gate
 
 smoke: seed       ## end-to-end over real processes: uvicorn + MCP stdio + approval CLI
 	$(PY) scripts/smoke_e2e.py

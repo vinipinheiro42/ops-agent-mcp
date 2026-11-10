@@ -1,0 +1,69 @@
+# CI for the portfolio project. Written and dry-run locally step by step (same commands, frozen uv.lock);
+# never executed on GitHub - the repository has no remote.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPS_AGENT_PROVIDER: offline   # CI never needs or receives a model API key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.7"
+          enable-cache: true
+      - name: Install (frozen lockfile)
+        run: uv sync --frozen --extra dev --python 3.11
+      - name: Lint
+        run: |
+          uv run --frozen ruff check src tests scripts
+          uv run --frozen ruff format --check src tests scripts
+      - name: Type check
+        run: uv run --frozen mypy
+      - name: Tests
+        run: uv run --frozen pytest -q
+      - name: Offline evaluation (gate on evals/thresholds.json)
+        run: >
+          uv run --frozen ops-agent eval --gate
+          --report eval-report.md --json eval-results.json
+      - name: End-to-end smoke (uvicorn + MCP stdio + approval CLI)
+        run: |
+          uv run --frozen ops-agent seed --seed 42 > /dev/null
+          uv run --frozen python scripts/smoke_e2e.py
+        env:
+          OPS_AGENT_DATA_DIR: ${{ runner.temp }}/data
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            eval-report.md
+            eval-results.json
+
+  image:
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (no push)
+        run: docker build --tag northwind/ops-agent:ci .
+      - name: Container smoke
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/data:/data" northwind/ops-agent:ci seed --seed 42 > /dev/null
+          docker run --rm -v "$RUNNER_TEMP/data:/data" northwind/ops-agent:ci triage --sandbox NW-1052

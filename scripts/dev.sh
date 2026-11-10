@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Same tasks as the Makefile, for machines without `make`.  Usage: scripts/dev.sh <setup|seed|api|mcp|test|check|smoke>
+# Same tasks as the Makefile, for machines without `make`.  Usage: scripts/dev.sh <setup|seed|api|mcp|test|check|eval|smoke>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python
@@ -18,6 +18,7 @@ case "${1:-}" in
     "$PY" -m ruff format --check src tests scripts
     "$PY" -m mypy
     "$PY" -m pytest ;;
+  eval)  "$PY" -m ops_agent.cli eval --report docs/06-evaluation-report.md --json evals/results/offline-latest.json --gate ;;
   smoke) "$PY" -m ops_agent.cli seed --seed "${SEED:-42}" >/dev/null && "$PY" scripts/smoke_e2e.py ;;
-  *) echo "usage: $0 <setup|seed|api|mcp|test|check|smoke>"; exit 2 ;;
+  *) echo "usage: $0 <setup|seed|api|mcp|test|check|eval|smoke>"; exit 2 ;;
 esac

@@ -2,7 +2,8 @@
 
 > **Fictional client, synthetic data.** Derived from the simulated discovery call in
 > [`01-discovery-call.md`](01-discovery-call.md). Numbers in *Success criteria* are **targets to be
-> measured** by the evaluation harness (milestone M4), not results.
+> measured** by the evaluation harness (milestone M4), not results. Measured offline numbers are in
+> [`06-evaluation-report.md`](06-evaluation-report.md).
 
 ## 1. Problem statement
 
@@ -58,11 +59,11 @@ flowchart LR
 | FR-6 | Human approval/rejection with identity, role check, no self-approval, 24 h expiry, stale-ticket detection | M2 ✅ |
 | FR-7 | Apply approved proposals exactly once (idempotent), resumable after failures | M2 ✅ |
 | FR-8 | Append-only, tamper-evident audit log of proposals and decisions | M2 ✅ |
-| FR-9 | Agent loop: triage a ticket end-to-end via MCP tools; answer policy questions with citations or abstain | M3 |
-| FR-10 | Treat ticket text and unverified docs as untrusted; refuse embedded instructions | M3 |
-| FR-11 | Trace every agent run (tool calls, tokens, latency, cost) | M3 |
-| FR-12 | Evaluation harness over a labelled set (~50 cases) with a rules-based baseline | M4 |
-| FR-13 | Containerised deployment, CI, runbook, incident post-mortem | M5 |
+| FR-9 | Agent loop: triage a ticket end-to-end via MCP tools; answer policy questions with citations or abstain | M3 ✅ (offline provider; real LLM untested) |
+| FR-10 | Treat ticket text and unverified docs as untrusted; refuse embedded instructions | M3 ✅ |
+| FR-11 | Trace every agent run (tool calls, tokens, latency, cost) | M3 ✅ (tokens estimated offline) |
+| FR-12 | Evaluation harness over a labelled set (~50 cases) with a rules-based baseline | M4 ✅ (55 cases) |
+| FR-13 | Containerised deployment, CI, runbook, incident post-mortem | M5 ✅ written; Docker image and GitHub workflow not executed |
 
 ## 6. Non-functional requirements
 

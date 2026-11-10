@@ -1,14 +1,15 @@
 # 03 — Architecture: Northwind Ops Agent
 
-> Fictional client, synthetic data. Status: **M1–M2 implemented** (data, fake API, MCP server, approvals).
-> Agent loop, tracing and evaluation are planned (M3–M4); they plug into the boundaries described here.
+> Fictional client, synthetic data. Status: **M1–M5 implemented** — data, fake API, MCP server, approvals,
+> agent loop with an offline provider, tracing, evaluation, packaging. Real-LLM providers are implemented
+> but have only been tested against mocked HTTP, never against a live model.
 
 ## 1. Overview
 
 ```mermaid
 flowchart LR
   subgraph AgentSide["Agent side — read-only identity"]
-    LLM["Agent loop (M3)<br/>LLM behind interface<br/>+ offline deterministic mode"]
+    LLM["Agent loop<br/>ModelClient (offline | anthropic | openai)<br/>+ guard / decision firewall"]
     MCP["MCP server<br/>northwind-ops"]
     RO["ReadOnlyTicketClient<br/>GET/HEAD only"]
     KB["DocStore<br/>BM25 over KB sections"]
@@ -47,7 +48,12 @@ invoked by a human.
 | MCP server | `src/ops_agent/mcp_server/` | Official `mcp` SDK (v2 `MCPServer`), typed tools with structured output and tool annotations; read tools + proposal tools |
 | Proposal store + audit | `src/ops_agent/approvals/store.py` | Separate SQLite DB; CAS state transitions; append-only hash-chained audit |
 | Approval service | `src/ops_agent/approvals/service.py` | Roster/role authorisation, self-approval ban, expiry, apply once, conflict handling |
-| CLI | `src/ops_agent/cli.py` | `seed`, `serve-api`, `serve-mcp`, `proposals`, `approve`, `reject`, `audit --verify` |
+| Agent loop | `src/ops_agent/agent/loop.py` | Bounded tool loop (≤ 6 model steps) over MCP; read-tool allowlist; structured `submit_triage` / `submit_answer`; converts a reviewed decision into `propose_*` calls |
+| Model providers | `src/ops_agent/agent/providers/` | `ModelClient` protocol; offline heuristic model (default); Anthropic Messages and OpenAI-compatible adapters over raw HTTP |
+| Guard + decision firewall | `src/ops_agent/agent/guard.py` | Injection detection, sanitising, untrusted envelopes, canary; citation/duplicate/routing/P1 rules; P1 circuit breaker |
+| Tracing | `src/ops_agent/agent/tracing.py` | One JSONL file per run: `run_start`, `model_call`, `tool_call`, `guard`, `proposal`, `run_end` with tokens, latency, estimated cost |
+| Evaluation | `src/ops_agent/evals/` | 55 labelled cases, rules baseline, compromised red-team model, metrics, markdown report, CI gate |
+| CLI | `src/ops_agent/cli.py` | `seed`, `serve-api`, `serve-mcp`, `proposals`, `approve`, `reject`, `audit --verify`, `triage`, `ask`, `eval` |
 
 ## 3. MCP tool contracts
 
@@ -151,11 +157,30 @@ service desk to support idempotency keys or an equivalent dedup (to verify durin
 **ADR-004 — Lexical retrieval (BM25) before embeddings.**
 *Decision:* dependency-free BM25 over section chunks with light stemming. *Why:* 30 short documents full of
 codes (`EDI 214`, `WAVE_ALLOC_TIMEOUT`, `SSCC`); deterministic, explainable, zero cost.
-*Revisit if:* M4 shows retrieval recall < 90% on the gold `relevant_docs`.
+*Revisit if:* retrieval recall < 90% on the gold `relevant_docs`. *Status:* not measured as a separate
+metric yet; the Q&A misses in the M4 report are mostly section selection, not retrieval.
 
 **ADR-005 — LLM behind an interface with an offline deterministic mode (M3).**
 *Decision:* the agent loop depends on a `ModelClient` protocol; a rules-based offline implementation is used
-in tests/CI and doubles as the M4 baseline. *Consequences:* CI needs no API key and sends no data.
+in tests/CI. The M4 baseline is a *separate*, simpler no-agent rule set (what native service-desk automation
+could do), so the offline agent is not compared with itself. *Consequences:* CI needs no API key and sends
+no data; offline numbers measure plumbing and safety layers, not model quality.
+
+**ADR-008 — The model decides, code proposes; a decision firewall sits between them.**
+*Context:* M2 made writes impossible without approval, but a hijacked model could still flood approvers
+with plausible-looking bad proposals (e.g. P1 escalations), which is its own failure mode.
+*Decision:* the model only gets read tools plus two structured "submit" tools. Code validates the
+decision with a firewall and only then calls `propose_*` over MCP. Firewall rules:
+citations must have been retrieved in this run **and** be `trust: verified`; `duplicate_of` must appear in
+`find_similar_tickets` results; team must follow KB-002 (incl. its exceptions); P1 needs impact evidence
+in fields with **no** injection signal; at most 3 new P1 proposals per rolling hour (circuit breaker);
+links and the system-prompt canary are stripped from all output. Untrusted text reaches the model inside
+`<untrusted source=…>` envelopes with detected signals attached; flagged tickets get a
+`possible-prompt-injection` label on the proposal.
+*Consequences:* a fully compromised model (the red-team model in M4) cannot produce a policy-violating
+proposal in the evaluated scenarios; the cost is occasional over-caution (P1 withheld → `needs_human_priority`).
+Detection is regex-based and will miss novel phrasing — which is why the firewall rules, not detection,
+carry the guarantee.
 
 **ADR-006 — SQLite for the fake API and the control plane.**
 *Decision:* two separate SQLite files (system of record vs. proposals/audit), WAL mode, `BEGIN IMMEDIATE`.
@@ -177,13 +202,17 @@ also ship events to write-once storage.
 | Vector database + embeddings from day one | Adds infra and cost before evidence that BM25 is insufficient (see ADR-004). |
 | Fine-tuned classifier only | Handles category/priority but not duplicates, ambiguity, or cited answers; kept as a future baseline. |
 | Heavy agent framework | Not needed for a single-agent loop with ~11 tools; easier to trace and test a small custom loop (M3). |
+| Letting the model call `propose_*` directly | Works, but then every policy check must live in the MCP server or the prompt; ADR-008 keeps the model's action space to "submit a decision". |
+| LLM-based injection classifier | Second model, same failure class, extra cost; regex detection + firewall rules first, revisit with real data. |
 | Native service-desk automation rules only | Good baseline for routing; cannot read free text robustly or cite policy. Used as the M4 baseline. |
 
 ## 8. Security notes
 
 - **Untrusted input:** ticket title/description/comments and `trust: unverified` documents are labelled in
-  tool outputs; KB-030 is a deliberately poisoned page for tests. M3 adds a policy layer that rejects
+  tool outputs; KB-030 is a deliberately poisoned page for tests. The decision firewall (ADR-008) rejects
   proposals which only an embedded instruction could justify (e.g. P1 on a single-user issue).
+- **Canary:** the system prompt contains `NWOPS-CANARY-7F3A`; any output containing it is redacted and logged
+  as `canary_leak`.
 - **Secrets:** none in code. The optional write token is read from `OPS_AGENT_WRITE_TOKEN` by the API and the
   approval service only; the MCP server never receives it.
 - **Blast radius:** max 5 pending proposals per ticket; proposals expire; no bulk tools.
