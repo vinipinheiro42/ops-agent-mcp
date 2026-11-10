@@ -48,3 +48,8 @@ mypy_path = "src"
 # Synthetic-data catalogues: long natural-language string literals are clearer unwrapped.
 "src/ops_agent/seed/catalog.py" = ["E501"]
 "src/ops_agent/seed/corpus.py" = ["E501"]
+# Regex and keyword tables read better unwrapped.
+"src/ops_agent/agent/guard.py" = ["E501"]
+"src/ops_agent/agent/heuristics.py" = ["E501"]
+# Markdown report template.
+"src/ops_agent/evals/report.py" = ["E501"]

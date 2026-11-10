@@ -30,3 +30,14 @@ def test_unknown_proposal_is_a_clean_error(
     capsys.readouterr()
     assert main(["reject", "prop_0000000000000000", "--actor", "pedro.okafor", "--reason", "n/a"]) == 1
     assert "ProposalNotFoundError" in capsys.readouterr().err
+
+
+def test_cli_triage_all_open_and_ask_in_sandbox(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from ops_agent.cli import main
+
+    assert main(["triage", "--sandbox", "--all-open", "--limit", "2", "--trace-dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert out.count("(pending)") >= 2 and "Sandbox run" in out
+    assert list(tmp_path.glob("run_*.jsonl"))
+    assert main(["ask", "--sandbox", "--trace-dir", str(tmp_path), "What is the cafeteria menu?"]) == 0
+    assert "could not find a supported answer" in capsys.readouterr().out

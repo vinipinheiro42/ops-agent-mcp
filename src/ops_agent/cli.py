@@ -7,6 +7,12 @@ proposals list|show          inspect proposals
 approve <id> --actor NAME    approve and apply a proposal (human step)
 reject <id> --actor NAME     reject a proposal
 audit [--verify]             print or verify the hash-chained audit log
+triage <id> | --all-open     run the triage agent; it only creates pending proposals
+ask "question"               cited answer from verified knowledge-base pages (or an abstention)
+eval [--gate]                offline evaluation: agent vs. baseline vs. red-team, markdown + JSON report
+
+Agent commands talk to the MCP server over stdio (child process; the API must be running), or with
+--sandbox to a fresh in-process copy of the synthetic environment (no servers needed).
 """
 
 from __future__ import annotations
@@ -137,6 +143,146 @@ def cmd_audit(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+# ---- agent ----------------------------------------------------------------------------------------
+
+
+def _print_triage(r: object) -> None:
+    from ops_agent.agent.loop import TriageResult
+
+    assert isinstance(r, TriageResult)
+    d = r.decision
+    summary = (
+        "no decision"
+        if d is None
+        else (
+            f"{d.action} category={d.category.value if d.category else '-'} "
+            f"priority={d.priority.value if d.priority else '-'} team={d.team.value if d.team else '-'}"
+            + (f" duplicate_of={d.duplicate_of}" if d.duplicate_of else "")
+        )
+    )
+    print(f"{r.ticket_id}: {r.status} | {summary}")
+    for f in r.flags:
+        print(f"    flag: {f}")
+    for b in r.blocked:
+        print(f"    blocked: {b}")
+    for p in r.proposals:
+        print(f"    proposal {p.get('proposal_id', p.get('id', '?'))}: {p.get('action')} ({p.get('status')})")
+    for e in r.proposal_errors:
+        print(f"    proposal error: {e}")
+
+
+async def _agent_session(args: argparse.Namespace, settings: Settings, work: object) -> int:
+    from collections.abc import Awaitable, Callable
+
+    from mcp import Client
+
+    from ops_agent.agent.loop import Agent
+    from ops_agent.agent.providers import make_model
+    from ops_agent.agent.tracing import Pricing
+    from ops_agent.runtime import sandbox, stdio_params
+
+    assert callable(work)
+    job: Callable[[Agent, Client], Awaitable[int]] = work
+    trace_dir = Path(args.trace_dir) if args.trace_dir else settings.data_dir / "traces"
+    model = make_model(args.provider)
+    if args.sandbox:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="ops-agent-sandbox-") as tmp:
+            async with sandbox(Path(tmp)) as sb:
+                agent = Agent(sb.mcp, model, trace_dir=trace_dir, pricing=Pricing.from_env())
+                return await job(agent, sb.mcp)
+    async with Client(stdio_params()) as client:
+        agent = Agent(client, model, trace_dir=trace_dir, pricing=Pricing.from_env())
+        return await job(agent, client)
+
+
+def cmd_triage(args: argparse.Namespace, settings: Settings) -> int:
+    async def job(agent: object, client: object) -> int:
+        from mcp import Client
+
+        from ops_agent.agent.loop import Agent
+
+        assert isinstance(agent, Agent) and isinstance(client, Client)
+        ids: list[str] = list(args.ids)
+        if args.all_open:
+            res = await client.call_tool("search_tickets", {"status": "open", "untriaged": True, "limit": 50})
+            if res.is_error:
+                print(f"search_tickets failed: {res.content}", file=sys.stderr)
+                return 1
+            data = res.structured_content or {}
+            ids += [t["id"] for t in data.get("items", [])][: args.limit]
+        if not ids:
+            print("nothing to triage (give ticket ids or --all-open)", file=sys.stderr)
+            return 1
+        for tid in ids:
+            _print_triage(await agent.triage(tid))
+        if args.sandbox:
+            print("\nSandbox run: proposals lived in a temporary copy and were discarded.")
+        else:
+            print("\nNothing was changed. Review with `ops-agent proposals list`, then approve/reject.")
+        return 0
+
+    return asyncio.run(_agent_session(args, settings, job))
+
+
+def cmd_ask(args: argparse.Namespace, settings: Settings) -> int:
+    async def job(agent: object, client: object) -> int:
+        from ops_agent.agent.loop import Agent
+
+        assert isinstance(agent, Agent)
+        r = await agent.answer(args.question)
+        if r.answer.abstain:
+            print("I could not find a supported answer in the verified knowledge base.")
+            if r.answer.answer:
+                print(r.answer.answer)
+        else:
+            print(r.answer.answer)
+            print("Sources: " + ", ".join(r.answer.citations))
+        return 0
+
+    return asyncio.run(_agent_session(args, settings, job))
+
+
+def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
+    import tempfile
+
+    from ops_agent.evals.report import check_gate, render_markdown, results_json
+    from ops_agent.evals.runner import run_eval
+
+    with tempfile.TemporaryDirectory(prefix="ops-agent-eval-") as tmp:
+        trace_dir = Path(args.trace_dir) if args.trace_dir else None
+        res = asyncio.run(run_eval(Path(tmp), provider=args.provider, trace_dir=trace_dir))
+    if args.report:
+        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.report).write_text(render_markdown(res))
+        print(f"report: {args.report}")
+    if args.json:
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(json.dumps(results_json(res), indent=1, default=str) + "\n")
+        print(f"results: {args.json}")
+    a, b = res.metrics["agent"], res.metrics["baseline"]
+    for key in (
+        "category_accuracy",
+        "priority_accuracy",
+        "team_accuracy",
+        "duplicate_precision",
+        "injection_cases_with_violation",
+        "qa_accuracy",
+        "qa_abstention_correct",
+    ):
+        print(f"{key:<34} agent={a[key]!s:<8} baseline={b[key]!s}")
+    print(f"{'redteam injection violations':<34} {res.metrics['redteam']['injection_cases_with_violation']}")
+    print(f"{'unapproved writes':<34} {res.unapproved_writes}")
+    if args.gate:
+        problems = check_gate(res, Path(args.thresholds))
+        if problems:
+            print("GATE FAILED:\n  " + "\n  ".join(problems), file=sys.stderr)
+            return 3
+        print("gate: PASS")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ops-agent", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -178,6 +324,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--proposal")
     s.add_argument("--verify", action="store_true")
     s.set_defaults(func=cmd_audit)
+
+    def agent_opts(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--provider", help="offline (default) | anthropic | openai; or OPS_AGENT_PROVIDER")
+        sp.add_argument("--sandbox", action="store_true", help="use a fresh in-process synthetic environment")
+        sp.add_argument("--trace-dir", help="JSONL trace directory (default: <data>/traces)")
+
+    s = sub.add_parser("triage", help="triage tickets (creates pending proposals only)")
+    s.add_argument("ids", nargs="*")
+    s.add_argument("--all-open", action="store_true", help="every new, untriaged ticket")
+    s.add_argument("--limit", type=int, default=50)
+    agent_opts(s)
+    s.set_defaults(func=cmd_triage)
+
+    s = sub.add_parser("ask", help="cited answer from the verified knowledge base")
+    s.add_argument("question")
+    agent_opts(s)
+    s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("eval", help="run the offline evaluation")
+    s.add_argument("--provider")
+    s.add_argument("--report", help="write the markdown report here")
+    s.add_argument("--json", help="write per-case JSON results here")
+    s.add_argument("--trace-dir")
+    s.add_argument("--gate", action="store_true", help="exit 3 if a threshold in --thresholds fails")
+    s.add_argument("--thresholds", default="evals/thresholds.json")
+    s.set_defaults(func=cmd_eval)
     return parser
 
 
